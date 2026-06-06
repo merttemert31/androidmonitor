@@ -1,1 +1,197 @@
+name: Android APK / AAB Build
 
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-android:
+    runs-on: ubuntu-latest
+
+    env:
+      JAVA_VERSION: '17'
+      ANDROID_API_LEVEL: '34'
+      ANDROID_BUILD_TOOLS: '34.0.0'
+      ANDROID_NDK_VERSION: '26.3.11579264'
+      CMAKE_VERSION: '3.22.1'
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect Android project directory
+        id: project
+        shell: bash
+        run: |
+          if [[ -f settings.gradle.kts && -d app ]]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+            echo "Detected project in repository root"
+          elif [[ -f NetScope/settings.gradle.kts && -d NetScope/app ]]; then
+            echo "dir=NetScope" >> "$GITHUB_OUTPUT"
+            echo "Detected project in NetScope/ subdirectory"
+          else
+            echo "Unable to locate Android project (expected ./app or ./NetScope/app)"
+            exit 1
+          fi
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK / NDK packages
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-${ANDROID_API_LEVEL}" \
+            "build-tools;${ANDROID_BUILD_TOOLS}" \
+            "cmake;${CMAKE_VERSION}" \
+            "ndk;${ANDROID_NDK_VERSION}"
+
+      - name: Make helper scripts executable
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          chmod +x scripts/*.sh || true
+
+      - name: Prepare signing keystore (optional)
+        id: signing
+        shell: bash
+        env:
+          ANDROID_SIGNING_KEYSTORE_BASE64: ${{ secrets.ANDROID_SIGNING_KEYSTORE_BASE64 }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          signed=false
+          if [[ -n "${ANDROID_SIGNING_KEYSTORE_BASE64}" && -n "${ANDROID_SIGNING_STORE_PASSWORD}" && -n "${ANDROID_SIGNING_KEY_ALIAS}" && -n "${ANDROID_SIGNING_KEY_PASSWORD}" ]]; then
+            mkdir -p "$RUNNER_TEMP/netscope-signing"
+            printf '%s' "$ANDROID_SIGNING_KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/netscope-signing/release.keystore"
+            echo "store_file=$RUNNER_TEMP/netscope-signing/release.keystore" >> "$GITHUB_OUTPUT"
+            signed=true
+          fi
+          echo "signed=$signed" >> "$GITHUB_OUTPUT"
+
+      - name: Detect pinned vendor configuration
+        id: vendor
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          enabled=false
+          if [[ -f third_party/VERSIONS.env ]]; then
+            if ! grep -q 'REPLACE_WITH_BADVPN_COMMIT' third_party/VERSIONS.env && \
+               ! grep -q 'REPLACE_WITH_LIBANCILLARY_COMMIT' third_party/VERSIONS.env; then
+              enabled=true
+            fi
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - name: Vendor pinned badvpn sources
+        if: steps.vendor.outputs.enabled == 'true'
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          ./scripts/vendor_badvpn_pinned.sh
+
+      - name: Build vendored tun2socks binaries
+        if: steps.vendor.outputs.enabled == 'true'
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+        run: |
+          ./scripts/build_badvpn_android.sh
+
+      - name: Assemble debug + release APK and AAB
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_SDK_ROOT }}/ndk/${{ env.ANDROID_NDK_VERSION }}
+          NETSCOPE_SIGNING_STORE_FILE: ${{ steps.signing.outputs.store_file }}
+          NETSCOPE_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+          NETSCOPE_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          NETSCOPE_SIGNING_KEY_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_PASSWORD }}
+        run: |
+          gradle --no-daemon assembleDebug assembleRelease bundleRelease
+
+      - name: Show outputs
+        shell: bash
+        run: |
+          ls -lah "${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug" || true
+          ls -lah "${{ steps.project.outputs.dir }}/app/build/outputs/apk/release" || true
+          ls -lah "${{ steps.project.outputs.dir }}/app/build/outputs/bundle/release" || true
+
+      - name: Prepare release assets
+        if: startsWith(github.ref, 'refs/tags/')
+        id: release_assets
+        shell: bash
+        working-directory: ${{ steps.project.outputs.dir }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/netscope-release-assets"
+          TAG_NAME="${GITHUB_REF_NAME}"
+          cp app/build/outputs/apk/release/*.apk "$RUNNER_TEMP/netscope-release-assets/${TAG_NAME}-release.apk"
+          cp app/build/outputs/bundle/release/*.aab "$RUNNER_TEMP/netscope-release-assets/${TAG_NAME}-release.aab"
+          (cd "$RUNNER_TEMP/netscope-release-assets" && sha256sum * > SHA256SUMS.txt)
+          echo "dir=$RUNNER_TEMP/netscope-release-assets" >> "$GITHUB_OUTPUT"
+
+      - name: Upload debug APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netscope-debug-apk
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Upload release APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netscope-release-apk
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload release AAB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: netscope-release-aab
+          path: ${{ steps.project.outputs.dir }}/app/build/outputs/bundle/release/*.aab
+          if-no-files-found: error
+
+      - name: Publish GitHub Release from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            ${{ steps.release_assets.outputs.dir }}/*
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: netscope-build-logs
+          path: |
+            ${{ steps.project.outputs.dir }}/app/build/outputs/logs/**
+            ${{ steps.project.outputs.dir }}/native-build/tun2socks/obj/**
+            ${{ steps.project.outputs.dir }}/native-build/tun2socks/libs/**
+          if-no-files-found: ignore
