@@ -41,19 +41,30 @@ class PacketCaptureVpnService : VpnService() {
     private var badvpnRunner: BadvpnTun2SocksRunner? = null
     private var badvpnProcessStarted = false
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    return runCatching {
         when (intent?.action ?: ACTION_START) {
             ACTION_STOP -> {
                 stopCapture("Capture stopped")
                 stopSelf()
-                return START_NOT_STICKY
+                START_NOT_STICKY
             }
 
-            ACTION_START -> startCapture()
-        }
-        return START_STICKY
-    }
+            ACTION_START -> {
+                startCapture()
+                START_STICKY
+            }
 
+            else -> START_STICKY
+        }
+    }.getOrElse { error ->
+        CaptureRepository.reportError(
+            "Service start error: ${error.message ?: error.javaClass.simpleName}",
+        )
+        stopSelf()
+        START_NOT_STICKY
+    }
+}
     override fun onDestroy() {
         stopCapture("Capture stopped")
         super.onDestroy()
@@ -63,14 +74,20 @@ class PacketCaptureVpnService : VpnService() {
         if (tunInterface != null) return
 
         val settings = SettingsRepository.settings.value
-        createNotificationChannel()
-        startForeground(
-            NOTIFICATION_ID,
-            buildNotification(
-                getString(R.string.app_name),
-                "Capture aktif • gerçek badvpn varsa TCP tun2socks, yoksa Java UDP fallback",
-            ),
-        )
+createNotificationChannel()
+ServiceCompat.startForeground(
+    this,
+    NOTIFICATION_ID,
+    buildNotification(
+        getString(R.string.app_name),
+        "Capture aktif • gerçek badvpn varsa TCP tun2socks, yoksa Java UDP fallback",
+    ),
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+    } else {
+        0
+    },
+)
 
         val builder = Builder()
             .setSession(getString(R.string.app_name))
